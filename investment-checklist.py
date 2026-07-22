@@ -804,11 +804,18 @@ def generate_report(
         )
 
     # ── 总结 ──
-    if passed >= 4:
+    # 安全边际降级：生意再好，价格太贵也不应通过
+    effective_passed = passed
+    if g5 < 3 and effective_passed >= 4:
+        effective_passed = passed - 1  # 通过 → 灰色
+    elif g5 < 2 and effective_passed >= 3:
+        effective_passed = passed - 1  # 灰色 → 不通过
+
+    if effective_passed >= 4:
         conclusion = "✅ **Checklist 总体评估：通过** — 可以进入深度研究阶段\n"
         if g5 < 3:
             conclusion += "\n⚠️ 注意：安全边际评分较低，建议等待更好的价格"
-    elif passed >= 3:
+    elif effective_passed >= 3:
         conclusion = "❓ **灰色地带** — 关键指标有亮点也有顾虑，需投资者自行判断"
     else:
         conclusion = "❌ **未通过 Checklist** — 多项核心指标不达标"

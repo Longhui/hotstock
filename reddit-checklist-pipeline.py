@@ -274,6 +274,17 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         total = g1 + g2 + g3 + g4 + g5
         passed = sum(1 for s in (g1, g2, g3, g4, g5) if s >= 3)
 
+        # ── 安全边际降级规则 ──
+        # 生意再好，价格太贵也不应通过（ROI 的关键来源是买入价格）
+        if g5 < 3 and passed >= 4:
+            passed -= 1  # 通过 → 灰色
+        elif g5 < 2 and passed >= 3:
+            passed -= 1  # 灰色 → 不通过
+
+        # ── 否决清单 ──
+        if vetoes:
+            passed = 0  # 触发否决 → 直接不通过
+
         return {
             "ticker": ticker,
             "company_name": company.get("name", ticker),
@@ -462,6 +473,126 @@ def generate_comprehensive_report(
 
 
 # ╔══════════════════════════════════════════════════════════════╗
+# ║  MD → PDF 转换 (markdown + Edge headless)                  ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def md_to_pdf(md_path: str) -> Optional[str]:
+    """将 Markdown 报告转为 PDF（用于邮件附件）。"""
+    try:
+        import markdown as md_lib
+    except ImportError:
+        logger.warning("  ⚠️ markdown 库未安装，无法生成 PDF")
+        return None
+
+    # Edge 可执行文件路径
+    EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+    if not os.path.exists(EDGE_PATH):
+        logger.warning("  ⚠️ 未找到 Edge 浏览器，无法生成 PDF")
+        return None
+
+    pdf_path = md_path.replace(".md", ".pdf")
+
+    try:
+        # 1. 读取 MD
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_content = f.read()
+
+        # 2. MD → HTML
+        html_body = md_lib.markdown(md_content, extensions=["tables", "fenced_code"])
+
+        # 3. 包裹打印样式 HTML
+        html_full = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  @page {{ margin: 2cm; }}
+  body {{
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    font-size: 12pt;
+    line-height: 1.7;
+    color: #1a1a1a;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+  }}
+  h1 {{ font-size: 20pt; color: #1a1a2e; border-bottom: 2px solid #1a1a2e; padding-bottom: 6px; }}
+  h2 {{ font-size: 16pt; color: #16213e; margin-top: 24px; }}
+  h3 {{ font-size: 13pt; color: #0f3460; }}
+  table {{
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0;
+    font-size: 11pt;
+  }}
+  th, td {{
+    border: 1px solid #ccc;
+    padding: 6px 10px;
+    text-align: left;
+  }}
+  th {{ background: #1a1a2e; color: #fff; font-weight: 600; }}
+  tr:nth-child(even) {{ background: #f5f5f5; }}
+  code {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 10pt; }}
+  pre {{ background: #f5f5f5; padding: 12px; border-radius: 6px; overflow-x: auto; }}
+  blockquote {{
+    border-left: 4px solid #1a1a2e;
+    margin: 12px 0;
+    padding: 8px 16px;
+    background: #f9f9f9;
+    color: #555;
+  }}
+  hr {{ border: none; border-top: 1px solid #ddd; margin: 24px 0; }}
+  .star {{ color: #f5a623; }}
+</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>"""
+
+        # 4. 临时 HTML 文件
+        html_path = md_path.replace(".md", "_temp.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_full)
+
+        # 5. Edge headless → PDF
+        import subprocess
+        result = subprocess.run(
+            [
+                EDGE_PATH,
+                "--headless",
+                f"--print-to-pdf={os.path.abspath(pdf_path)}",
+                "--print-to-pdf-no-header",
+                os.path.abspath(html_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning(f"  ⚠️ Edge PDF 转换返回非零: {result.stderr[:200]}")
+        os.remove(html_path)
+
+        if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+            logger.info(f"  📄 PDF 已生成: {os.path.basename(pdf_path)}")
+            return pdf_path
+        else:
+            logger.warning("  ⚠️ PDF 文件异常（为空或过小）")
+            if os.path.exists(pdf_path):
+                os.remove(pdf_path)
+            return None
+
+    except Exception as e:
+        logger.warning(f"  ⚠️ PDF 生成失败: {e}")
+        # 清理临时文件
+        html_path = md_path.replace(".md", "_temp.html")
+        if os.path.exists(html_path):
+            os.remove(html_path)
+        return None
+
+
+# ╔══════════════════════════════════════════════════════════════╗
 # ║  邮件发送                                                   ║
 # ╚══════════════════════════════════════════════════════════════╝
 
@@ -531,7 +662,7 @@ def send_email(report_path: Optional[str], results: List[Dict[str, Any]], top_n:
                 body_lines.append(f"  · {r['company_name']}（{r['ticker']}）— {r['total']}/25")
         body_lines.append("")
 
-    body_lines.append("详细分析报告已附在附件中。")
+    body_lines.append("详细分析报告（PDF）已附在附件中。")
     body_lines.append("")
     body_lines.append("⚠️ 免责声明：本报告为自动化分析工具，不构成投资建议。")
     body_text = "\n".join(body_lines)
@@ -543,16 +674,27 @@ def send_email(report_path: Optional[str], results: List[Dict[str, Any]], top_n:
     msg["Subject"] = f"Reddit 热门股 · 巴菲特 Checklist 分析报告 ({CURRENT_DATE})"
     msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
-    # 附上报告文件
+    # 附上报告文件（优先转 PDF）
+    attachment_path = None
     if report_path and os.path.exists(report_path):
-        with open(report_path, "rb") as f:
+        # 尝试转为 PDF
+        pdf_path = md_to_pdf(report_path)
+        if pdf_path:
+            attachment_path = pdf_path
+        else:
+            attachment_path = report_path
+
+        with open(attachment_path, "rb") as f:
             attachment = MIMEBase("application", "octet-stream")
             attachment.set_payload(f.read())
         encoders.encode_base64(attachment)
+
+        ext = os.path.splitext(attachment_path)[1]
+        mime_type = "application/pdf" if ext == ".pdf" else "text/markdown"
         attachment.add_header(
             "Content-Disposition",
             "attachment",
-            filename=("utf-8", "", os.path.basename(report_path)),
+            filename=("utf-8", "", os.path.basename(attachment_path)),
         )
         msg.attach(attachment)
 
