@@ -12,7 +12,8 @@ if not exist "venv\Scripts\python.exe" (
     echo ❌ 未找到虚拟环境 (venv)，请先执行初始化：
     echo    python -m venv venv
     echo    venv\Scripts\pip install -r requirements.txt
-    pause
+    echo    （5 秒后自动退出）
+    timeout /t 5 >nul
     exit /b 1
 )
 
@@ -31,5 +32,5 @@ python reddit-checklist-pipeline.py --top 15
 echo.
 echo ✅ 执行完毕！
 echo.
-
-pause
+echo 报告已保存到 output/ 目录
+echo 窗口将在 10 秒后自动关闭...
