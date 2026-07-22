@@ -22,11 +22,17 @@ import argparse
 import importlib.util
 import logging
 import os
+import random
 import re
+import smtplib
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(
@@ -39,6 +45,18 @@ logger = logging.getLogger(__name__)
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+
+# ── 代理配置 ──
+PROXY = "http://127.0.0.1:3067"
+os.environ["HTTP_PROXY"] = PROXY
+os.environ["HTTPS_PROXY"] = PROXY
+os.environ["http_proxy"] = PROXY
+os.environ["https_proxy"] = PROXY
+
+# 全局超时（yfinance 连接有时较慢）
+os.environ["YFINANCE_TIMEOUT"] = "60"
+import socket
+socket.setdefaulttimeout(60)
 
 # ── 导入项目现有模块 ──
 # sources/reddit_scraper.py (RSS 快速抓取)
@@ -73,61 +91,69 @@ CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  Step 1: Reddit RSS 快速抓取 (跳过 Pushshift)              ║
+# ║  Step 1: Reddit RSS 抓取 (limit=100, 无需 API 凭证)        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def fetch_reddit_rss(sub: str, max_posts: int = 20, max_age_days: int = 7) -> list:
-    """从单个 Reddit 子版块 RSS 获取帖子（快速，无需 API 凭证）。"""
+def fetch_reddit_rss(sub: str, max_posts: int = 100, max_age_days: int = 7) -> list:
+    """从 Reddit RSS 获取帖子（limit=100，自动重试，无需 API 凭证）。"""
     import requests
     import feedparser
 
-    url = f"https://www.reddit.com/r/{sub}/.rss"
+    limit = min(max_posts, 100)
+    url = f"https://www.reddit.com/r/{sub}/.rss?limit={limit}"
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     posts = []
 
-    try:
-        resp = requests.get(url, timeout=15, headers=HEADERS)
-        if resp.status_code != 200:
-            logger.debug(f"  RSS r/{sub}: HTTP {resp.status_code}")
-            return []
-        feed = feedparser.parse(resp.content)
-        for entry in feed.entries:
-            published = entry.get("published_parsed")
-            created = None
-            if published:
-                try:
-                    created = datetime(*published[:6], tzinfo=timezone.utc)
-                except Exception:
-                    pass
-            if created and created < cutoff:
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, timeout=30, headers=HEADERS)
+            if resp.status_code != 200:
+                logger.debug(f"  RSS r/{sub}: HTTP {resp.status_code} (attempt {attempt+1})")
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+                return []
+            feed = feedparser.parse(resp.content)
+            for entry in feed.entries:
+                published = entry.get("published_parsed")
+                created = None
+                if published:
+                    try:
+                        created = datetime(*published[:6], tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                if created and created < cutoff:
+                    continue
+
+                title = entry.get("title", "") or ""
+                summary_raw = entry.get("summary", "") or ""
+                summary = re.sub(r"<[^>]+>", "", summary_raw)
+                body = f"{title} {summary}"
+                link = entry.get("link", "")
+
+                posts.append({
+                    "source": "reddit",
+                    "source_sub": sub,
+                    "title": title,
+                    "body": summary,
+                    "url": link,
+                    "score": 0,
+                    "comments": 0,
+                    "created_utc": created,
+                    "tickers_mentioned": extract_tickers(body),
+                })
+                if len(posts) >= max_posts:
+                    break
+            break  # 成功则跳出重试循环
+        except Exception as e:
+            logger.debug(f"RSS r/{sub} (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                time.sleep(3)
                 continue
-
-            title = entry.get("title", "")
-            summary_raw = entry.get("summary", "") or ""
-            summary = re.sub(r"<[^>]+>", "", summary_raw)
-            body = f"{title} {summary}"
-            link = entry.get("link", "")
-
-            posts.append({
-                "source": "reddit",
-                "source_sub": sub,
-                "title": title,
-                "body": summary,
-                "url": link,
-                "score": 0,
-                "comments": 0,
-                "created_utc": created,
-                "tickers_mentioned": extract_tickers(body),
-            })
-            if len(posts) >= max_posts:
-                break
-    except Exception as e:
-        logger.debug(f"RSS r/{sub}: {e}")
-
     return posts
 
 
-def fetch_all_subs(max_posts_per_sub: int = 20, max_age_days: int = 7,
+def fetch_all_subs(max_posts_per_sub: int = 100, max_age_days: int = 7,
                    sub_filter: Optional[List[str]] = None) -> list:
     """遍历子版块，聚合 RSS 帖子。"""
     subs = sub_filter or SUBREDDITS
@@ -140,7 +166,7 @@ def fetch_all_subs(max_posts_per_sub: int = 20, max_age_days: int = 7,
             all_posts.extend(posts)
         except Exception as e:
             logger.warning(f"r/{sub}: {e}")
-        time.sleep(0.3)  # 限流礼貌
+        time.sleep(1.0)  # 限流礼貌
     return all_posts
 
 
@@ -174,18 +200,54 @@ def rank_tickers(posts: list) -> List[Dict[str, Any]]:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
-    """对单个 ticker 执行投资 Checklist 分析。"""
+    """对单个 ticker 执行投资 Checklist 分析（含自动重试）。"""
     mod = _load_checklist()
-    try:
-        # 识别公司
-        company = mod.identify_company(ticker)
-        if company.get("error"):
-            logger.warning(f"  ⚠️ {ticker}: {company['error']}")
-            return None
 
-        # 数据收集
-        data = mod.collect_financial_data(company)
-        news = mod.collect_news(ticker)
+    # ── 带重试的 yfinance 调用（代理不稳定时自动重试） ──
+    max_retries = 3
+    last_err = None
+    company = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            company = mod.identify_company(ticker)
+            if company.get("error"):
+                # 404 等明确错误不用重试
+                logger.warning(f"  ⚠️ {ticker}: {company['error']}")
+                return None
+            # 成功拿到数据，跳出重试循环
+            break
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt < max_retries:
+                wait = attempt * 5  # 5s, 10s, 15s
+                logger.debug(f"  ⏳ {ticker} 第{attempt}次失败，{wait}s后重试...")
+                time.sleep(wait)
+            else:
+                logger.warning(f"  ⚠️ {ticker}: 重试{max_retries}次仍失败 — {e}")
+    if company is None:
+        logger.warning(f"  ⚠️ {ticker}: 连接失败，跳过")
+        return None
+
+    try:
+        # 数据收集（同样加重试）
+        data = None
+        news = []
+        for attempt in range(1, max_retries + 1):
+            try:
+                data = mod.collect_financial_data(company)
+                news = mod.collect_news(ticker)
+                break
+            except (ConnectionError, TimeoutError, OSError) as e:
+                last_err = e
+                if attempt < max_retries:
+                    wait = attempt * 5
+                    logger.debug(f"  ⏳ {ticker} 数据收集第{attempt}次失败，{wait}s后重试...")
+                    time.sleep(wait)
+                else:
+                    logger.warning(f"  ⚠️ {ticker}: 数据收集重试{max_retries}次仍失败 — {e}")
+        if data is None:
+            return None
 
         # 信息评级
         grade, grade_desc = mod.grade_information_availability(company)
@@ -400,6 +462,113 @@ def generate_comprehensive_report(
 
 
 # ╔══════════════════════════════════════════════════════════════╗
+# ║  邮件发送                                                   ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+SMTP_CONFIG = {
+    "server": "smtp.163.com",
+    "port": 465,
+    "user": "mystock666@163.com",
+    "password": "RJdvWhm7c9reVeCT",
+    "recipient": "mystock666@163.com",
+}
+
+
+def send_email(report_path: Optional[str], results: List[Dict[str, Any]], top_n: int) -> bool:
+    """将分析结果通过邮件发送：正文为总结，附件为完整报告。"""
+    passed_count = sum(1 for r in results if r["passed_gates"] >= 4)
+    gray_count = sum(1 for r in results if 3 <= r["passed_gates"] < 4)
+    fail_count = sum(1 for r in results if r["passed_gates"] < 3)
+
+    # ── 邮件正文：总结摘要 ──
+    body_lines = [
+        f"Reddit 热门股票 · 巴菲特 Checklist 分析报告",
+        f"分析日期: {CURRENT_DATE}",
+        f"分析覆盖: Top {min(top_n, len(results))} 热门股（成功分析 {len(results)} 只）",
+        "",
+        "━━━ 分析概况 ━━━",
+        f"  ✅ 通过（>=4关）: {passed_count} 只",
+        f"  ❓ 灰色地带（3关）: {gray_count} 只",
+        f"  ❌ 未通过（<3关）: {fail_count} 只",
+        "",
+        "━━━ 评分排名 ━━━",
+    ]
+
+    # 排名表头
+    max_ticker = max(len(r["ticker"]) for r in results)
+    header = f"  {'#':>3s}  {'Ticker':>{max_ticker}s}  公司 {'总分':>4s}  结论"
+    body_lines.append(header)
+    body_lines.append("  " + "-" * (len(header) - 2))
+
+    for i, r in enumerate(results, 1):
+        name = r["company_name"]
+        name_display = name[:18] + "…" if len(name) > 18 else name
+        body_lines.append(
+            f"  {i:3d}  {r['ticker']:>{max_ticker}s}  {name_display:<18s}  "
+            f"{r['total']:>3d}/25  {conclusion_text(r['passed_gates'])}"
+        )
+    body_lines.append("")
+
+    # 分组列出
+    if passed_count:
+        body_lines.append("✅ 通过 Checklist 的公司：")
+        for r in results:
+            if r["passed_gates"] >= 4:
+                body_lines.append(f"  · {r['company_name']}（{r['ticker']}）— {r['total']}/25")
+        body_lines.append("")
+
+    if gray_count:
+        body_lines.append("❓ 灰色地带（需自行判断）：")
+        for r in results:
+            if 3 <= r["passed_gates"] < 4:
+                body_lines.append(f"  · {r['company_name']}（{r['ticker']}）— {r['total']}/25")
+        body_lines.append("")
+
+    if fail_count:
+        body_lines.append("❌ 未通过 Checklist：")
+        for r in results:
+            if r["passed_gates"] < 3:
+                body_lines.append(f"  · {r['company_name']}（{r['ticker']}）— {r['total']}/25")
+        body_lines.append("")
+
+    body_lines.append("详细分析报告已附在附件中。")
+    body_lines.append("")
+    body_lines.append("⚠️ 免责声明：本报告为自动化分析工具，不构成投资建议。")
+    body_text = "\n".join(body_lines)
+
+    # ── 构造邮件 ──
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_CONFIG["user"]
+    msg["To"] = SMTP_CONFIG["recipient"]
+    msg["Subject"] = f"Reddit 热门股 · 巴菲特 Checklist 分析报告 ({CURRENT_DATE})"
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+    # 附上报告文件
+    if report_path and os.path.exists(report_path):
+        with open(report_path, "rb") as f:
+            attachment = MIMEBase("application", "octet-stream")
+            attachment.set_payload(f.read())
+        encoders.encode_base64(attachment)
+        attachment.add_header(
+            "Content-Disposition",
+            "attachment",
+            filename=("utf-8", "", os.path.basename(report_path)),
+        )
+        msg.attach(attachment)
+
+    # ── 发送 ──
+    try:
+        with smtplib.SMTP_SSL(SMTP_CONFIG["server"], SMTP_CONFIG["port"], timeout=30) as server:
+            server.login(SMTP_CONFIG["user"], SMTP_CONFIG["password"])
+            server.send_message(msg)
+        logger.info(f"📧 邮件已发送至 {SMTP_CONFIG['recipient']}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ 邮件发送失败: {e}")
+        return False
+
+
+# ╔══════════════════════════════════════════════════════════════╗
 # ║  Main                                                      ║
 # ╚══════════════════════════════════════════════════════════════╝
 
@@ -416,11 +585,11 @@ def main():
             "  python reddit-checklist-pipeline.py --subs wallstreetbets,stocks\n"
         ),
     )
-    parser.add_argument("--top", type=int, default=8, help="分析前 N 只热门股 (默认 8)")
+    parser.add_argument("--top", type=int, default=15, help="分析前 N 只热门股 (默认 15)")
     parser.add_argument("--min-score", type=float, default=0,
                         help="最低综合分门槛 (默认 0 = 不限)")
-    parser.add_argument("--max-posts", type=int, default=25,
-                        help="每子版块最多抓取帖子数 (默认 25)")
+    parser.add_argument("--max-posts", type=int, default=100,
+                        help="每子版块最多抓取帖子数 (默认 100，RSS limit=100 上限)")
     parser.add_argument("--no-save", action="store_true",
                         help="不保存报告到文件")
     parser.add_argument("--output", "-o",
@@ -429,6 +598,10 @@ def main():
                         help="指定子版块，逗号分隔 (默认全部)")
     parser.add_argument("--debug", action="store_true",
                         help="调试日志")
+    parser.add_argument("--email", action="store_true", default=True,
+                        help="发送邮件报告（默认开启）")
+    parser.add_argument("--no-email", action="store_false", dest="email",
+                        help="不发送邮件报告")
     args = parser.parse_args()
 
     if args.debug:
@@ -440,16 +613,60 @@ def main():
     if sub_list is None:
         sub_list = [
             "ValueInvesting", "SecurityAnalysis",
-            "investing", "stocks", "StockMarket",
-            "wallstreetbets",
+            "investing",
         ]
-        logger.info(f"  使用精选子版块: {', '.join(sub_list)}")
+        logger.info(f"  使用价值投资子版块: {', '.join(sub_list)}")
 
-    # 已知非股票 ticker 黑名单
-    NON_STOCK_TICKERS = {
-        "FY", "GMT", "AWS", "LTA", "DS", "CEO", "CFO", "ATH", "YTD",
-        "IPO", "ETF", "REIT", "YOY", "Q1", "Q2", "Q3", "Q4",
-        "FOMO", "HODL", "WSB", "BTFD", "IMO", "TLDR",
+    # ── Ticker 验证函数 ──
+    def is_valid_ticker(t: str) -> bool:
+        """过滤掉明显不是股票代码的文本。"""
+        # 长度：NYSE/NASDAQ ticker 通常 1-5 个大写字母
+        if not (1 <= len(t) <= 5):
+            return False
+        # 必须全部是大写字母
+        if not re.fullmatch(r'[A-Z][A-Z0-9]*', t):
+            return False
+        # 全是数字
+        if t.isdigit():
+            return False
+        # 常见 Reddit 用语 / 非股票缩写
+        if t in _NON_STOCK:
+            return False
+        # 单字母 A 到 Z（极少是真实股票，更可能是语境误提）
+        if len(t) == 1:
+            return False
+        # 常见英文单词（Reddit 正文中容易误提取）
+        if t in _COMMON_WORDS:
+            return False
+        return True
+
+    # 非股票缩写（Reddit 高频用语 / 财经缩写 / 通用术语）
+    _NON_STOCK = {
+        "FY", "GMT", "AWS", "LTA", "DS", "DR", "CEO", "CFO", "COO", "CTO",
+        "ATH", "YTD", "IPO", "ETF", "REIT", "YOY", "Q1", "Q2", "Q3", "Q4",
+        "FOMO", "HODL", "WSB", "BTFD", "IMO", "TLDR", "FYI", "AMA", "ELI5",
+        "TIL", "PSA", "DAE", "OP", "EDIT", "LOL", "ROFL", "SMH", "BTH",
+        "OTC", "SEC", "IRS", "GDP", "CPI", "PPI", "EPS", "DIV", "PEG",
+        "ROI", "ROA", "EBITDA", "PE", "PB", "PS", "EV", "TTM", "MRQ",
+        "UK", "EU", "USA", "NYC", "LAX", "SFO", "ATL",
+        "IMO", "ICYDK", "AFAIK", "IIRC", "YMMV",
+    }
+
+    # 常见英文单词（可能被 extract_tickers 误认为股票代码）
+    _COMMON_WORDS = {
+        "BIG", "HOT", "NEW", "TOP", "BEST", "FREE", "GOOD", "HIGH", "LOW",
+        "BUY", "SELL", "HOLD", "CALL", "PUT", "SAFE", "RISK", "DEAL",
+        "DUE", "UP", "DOWN", "YES", "NO", "OUT", "ALL", "ANY", "EACH",
+        "FACT", "IDEA", "LIST", "NOTE", "ONCE", "ONLY", "OPEN", "PLAN",
+        "PASS", "STOP", "THEN", "TRUE", "VERY", "WEEK", "WORK", "YEAR",
+        "TECH", "SOFT", "BANK", "GOLD", "OIL", "GAS", "WIND", "SOLAR",
+        "BOND", "DEBT", "CASH", "TAX", "BILL", "COIN", "CORE", "DATA",
+        "EDGE", "FAST", "FLOW", "FUND", "GAIN", "GROWTH", "LEAD", "LIFE",
+        "MASS", "MORE", "MOVE", "NEED", "NEXT", "PAID", "PAIR", "PICK",
+        "POST", "RATE", "REAL", "RISE", "SAVE", "SHIP", "SHOP", "SIDE",
+        "SIGN", "SITE", "SIZE", "SOLD", "SPOT", "STAR", "STEP", "TALK",
+        "TEAM", "TERM", "TURN", "UNDER", "WALK", "WALL", "WANT", "WARN",
+        "WAVE", "WIDE", "WILL", "WISH", "YOUR", "TL", "RH",
     }
 
     print("╔══════════════════════════════════════════════════════════╗")
@@ -478,16 +695,10 @@ def main():
         print("❌ 评分结果为空，退出。")
         sys.exit(1)
 
-    # 过滤：排除已知非个股（ETF、指数等）
-    NON_STOCK_TICKERS = {
-        "FY", "GMT", "AWS", "LTA", "DS", "DR",
-        "CEO", "CFO", "ATH", "YTD", "IPO", "ETF", "REIT",
-        "FOMO", "HODL", "WSB", "BTFD", "IMO", "TLDR",
-        "CNQQ", "KWEB", "VOO", "VTI", "SPY", "QQQ", "DIA", "IWM",
-    }
+    # 过滤：排除已知非个股（ETF、指数等），使用增强验证
     filtered = [s for s in all_scores
                 if s["score"] >= args.min_score
-                and s["ticker"] not in NON_STOCK_TICKERS]
+                and is_valid_ticker(s["ticker"])]
     top_scores = filtered[:args.top]
     logger.info(f"  排名前 {len(top_scores)}: {', '.join(s['ticker'] for s in top_scores)}")
 
@@ -496,12 +707,28 @@ def main():
     logger.info(f"🔍 查询公司名称...")
     names = batch_lookup(tickers_to_query)
 
-    # ── Step 3: 巴菲特 Checklist 分析 ──
-    target_tickers = [s["ticker"] for s in top_scores]
+    # ── Step 3: 巴菲特 Checklist 分析（过滤 ETF/基金） ──
+    target_tickers = []
+    filtered_out = []
+    for s in top_scores:
+        name = names.get(s["ticker"], "")
+        # 排除 ETF、基金、债券等非个股
+        if any(kw in name.upper() for kw in ("ETF", "FUND", "BOND", "INDEX", "TRUST", "PORTFOLIO")):
+            filtered_out.append(f"{s['ticker']}（{name}）")
+            continue
+        target_tickers.append(s["ticker"])
+    if filtered_out:
+        logger.info(f"  排除 ETF/基金: {', '.join(filtered_out)}")
     print(f"\n📋 Step 3/4: 执行巴菲特 Checklist 分析（{len(target_tickers)} 只）...")
 
     results: List[Dict[str, Any]] = []
-    for ticker in target_tickers:
+    for idx, ticker in enumerate(target_tickers):
+        # 每个 ticker 之间延时 5~10 秒，避免触发 Yahoo Finance 限流
+        if idx > 0:
+            delay = random.uniform(5, 10)
+            logger.debug(f"  等待 {delay:.1f}s 避免限流...")
+            time.sleep(delay)
+
         print(f"  🔍 分析 {ticker}...", end=" ", flush=True)
         result = analyze_ticker(ticker)
         if result:
@@ -537,18 +764,20 @@ def main():
     report = generate_comprehensive_report(reddit_summary, results, args.top)
 
     # 保存或打印
+    report_path = None
     if not args.no_save:
         output_dir = os.path.join(BASE_DIR, "output")
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = args.output or os.path.join(output_dir, f"巴菲特Checklist-Reddit综合报告_{timestamp}.md")
-        with open(path, "w", encoding="utf-8") as f:
+        report_path = args.output or os.path.join(output_dir, f"巴菲特Checklist-Reddit综合报告_{timestamp}.md")
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"\n  💾 报告已保存: {path}")
+        print(f"\n  💾 报告已保存: {report_path}")
     elif args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
+        report_path = args.output
+        with open(report_path, "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"\n  📄 报告已输出: {args.output}")
+        print(f"\n  📄 报告已输出: {report_path}")
 
     # 打印摘要
     print(f"\n{'=' * 60}")
@@ -570,6 +799,11 @@ def main():
         if len(name) > 18:
             name = name[:17] + "…"
         print(f"{i:3d}  {r['ticker']:>6s}  {name:<20s}  {r['total']:>3d}/25  {conclusion_text(r['passed_gates'])}")
+
+    # ── 邮件发送 ──
+    if args.email:
+        print(f"\n📧 正在发送邮件报告...")
+        send_email(report_path, results, args.top)
 
 
 if __name__ == "__main__":
