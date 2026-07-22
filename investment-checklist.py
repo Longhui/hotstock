@@ -53,8 +53,10 @@ def _yf_get_info(ticker: str) -> dict:
             if time.time() - mtime < _YF_CACHE_TTL:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                if isinstance(cached, dict) and cached.get("currentPrice"):
-                    return cached
+                if isinstance(cached, dict):
+                    price = cached.get("currentPrice") or cached.get("regularMarketPrice")
+                    if price:
+                        return cached
         except Exception:
             pass
 
@@ -1228,9 +1230,17 @@ def generate_comparison_table(results: List[Dict[str, Any]]) -> str:
         )
         total = g1 + g2 + g3 + g4 + g5
         passed = sum(1 for s in (g1, g2, g3, g4, g5) if s >= 3)
-        if passed >= 4:
+        # 应用软降级（与 generate_report 一致）
+        effective_passed = passed
+        if g5 < 3 and effective_passed >= 4:
+            effective_passed -= 1
+        if g5 <= 3 and g6 <= 3 and effective_passed >= 4:
+            effective_passed -= 1
+        if g5 <= 3 and g6 <= 4 and effective_passed >= 4 and g1 >= 4 and g3 >= 4:
+            effective_passed = max(effective_passed - 2, 2)
+        if effective_passed >= 4:
             conclusion = "✅ 通过"
-        elif passed >= 3:
+        elif effective_passed >= 3:
             conclusion = "❓ 灰色"
         else:
             conclusion = "❌ 未通过"
