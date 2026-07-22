@@ -239,12 +239,17 @@ def collect_financial_data(company: Dict[str, Any],
     d["sector"] = info.get("sector", "")
     d["industry"] = info.get("industry", "")
 
-    # ── Futu 额外字段 ──
+    # ── 52周高/低（优先 Futu 实时数据，yfinance 兜底） ──
     if futu_data:
         d["52w_high"] = futu_data.get("52w_high")
         d["52w_low"] = futu_data.get("52w_low")
         d["net_profit"] = futu_data.get("net_profit")
         d["net_asset"] = futu_data.get("net_asset")
+    else:
+        d["52w_high"] = info.get("fiftyTwoWeekHigh")
+        d["52w_low"] = info.get("fiftyTwoWeekLow")
+        d["net_profit"] = info.get("netIncomeToCommon")
+        d["net_asset"] = info.get("bookValue") * (info.get("sharesOutstanding", 0) or 1) if info.get("bookValue") else None
 
     return d
 
@@ -361,29 +366,36 @@ def gate1_circle_of_competence(data: Dict[str, Any], company: Dict[str, Any]) ->
 # ─── 第二关：好生意 ─────────────────────────────────
 
 def gate2_good_business(data: Dict[str, Any]) -> Tuple[int, Dict[str, Tuple[bool, str]]]:
-    """评分：ROE、毛利率、FCF、资本效率、负债水平。"""
-    details: Dict[str, Tuple[bool, str]] = {}
+    """评分：ROE、毛利率、FCF、资本效率、负债水平。
 
-    # 1. ROE
+    注：对银行/保险等金融行业放宽毛利率等指标要求，
+    更侧重 ROE 持续性和资本效率。
+    """
+    details: Dict[str, Tuple[bool, str]] = {}
+    sector = (data.get("sector") or "").lower()
+    industry = (data.get("industry") or "").lower()
+    is_financial = any(kw in sector + industry for kw in ["bank", "financial", "insurance", "diversified financial", "money center"])
+
+    # 1. ROE（核心指标，贯穿所有行业）
     roe = data.get("roe_pct")
     if roe is not None:
-        if roe > 25:
-            details["roe"] = (True, f"{roe:.1f}% > 25%，卓越")
-        elif roe > 20:
-            details["roe"] = (True, f"{roe:.1f}% > 20%，优秀")
-        elif roe > 15:
-            details["roe"] = (True, f"{roe:.1f}% > 15%，良好")
-        elif roe > 10:
-            details["roe"] = (False, f"{roe:.1f}%，一般")
+        if roe > 20:
+            details["roe"] = (True, f"{roe:.1f}% > 20%，卓越")
+        elif roe > 12:
+            details["roe"] = (True, f"{roe:.1f}% > 12%，优秀" + ("（金融行业标准）" if is_financial else ""))
+        elif roe > 8:
+            details["roe"] = (is_financial, f"{roe:.1f}%，金融业可接受" if is_financial else f"{roe:.1f}%，一般")
         else:
             details["roe"] = (False, f"{roe:.1f}%，偏低")
     else:
         details["roe"] = (False, "数据不足")
 
-    # 2. 毛利率
+    # 2. 毛利率（金融行业不适用，豁免）
     gm = data.get("gross_margin_pct")
     if gm is not None:
-        if gm > 60:
+        if is_financial:
+            details["gross_margin"] = (True, f"{gm:.1f}%（金融业参考）")
+        elif gm > 60:
             details["gross_margin"] = (True, f"{gm:.1f}% > 60%，极强定价权")
         elif gm > 40:
             details["gross_margin"] = (True, f"{gm:.1f}% > 40%，有定价权")
@@ -391,12 +403,15 @@ def gate2_good_business(data: Dict[str, Any]) -> Tuple[int, Dict[str, Tuple[bool
             details["gross_margin"] = (False, f"{gm:.1f}%，一般")
         else:
             details["gross_margin"] = (False, f"{gm:.1f}%，偏低")
+    elif is_financial:
+        details["gross_margin"] = (True, "金融行业，毛利率不适用")
     else:
         details["gross_margin"] = (False, "数据不足")
 
-    # 3. 自由现金流
+    # 3. 自由现金流/分红（金融以分红能力代理）
     fcf = data.get("free_cf")
     ocf = data.get("operating_cf")
+    div_yield = data.get("dividend_yield_pct")
     if fcf is not None and ocf is not None and ocf != 0:
         ratio = fcf / ocf
         if fcf > 0 and ratio > 0.7:
@@ -405,26 +420,43 @@ def gate2_good_business(data: Dict[str, Any]) -> Tuple[int, Dict[str, Tuple[bool
             details["fcf"] = (True, f"FCF 为正，良好")
         else:
             details["fcf"] = (False, f"FCF 为负 ({fcf:,.0f})，警示")
+    elif is_financial and div_yield and div_yield > 1:
+        details["fcf"] = (True, f"股息率 {div_yield:.2f}%，金融业以分红验证现金流")
     else:
         details["fcf"] = (False, "数据不足")
 
-    # 4. 资本效率（ROA 代理）
+    # 4. 资本效率（金融用 ROA，但标准不同）
     roa = data.get("roa_pct")
     if roa is not None:
-        if roa > 10:
-            details["capital_intensity"] = (True, f"ROA {roa:.1f}%，轻资产模式")
-        elif roa > 5:
-            details["capital_intensity"] = (True, f"ROA {roa:.1f}%，适中")
+        if is_financial:
+            if roa > 1.5:
+                details["capital_intensity"] = (True, f"ROA {roa:.2f}%，金融业优秀")
+            elif roa > 0.8:
+                details["capital_intensity"] = (True, f"ROA {roa:.2f}%，金融业稳健")
+            elif roa > 0.3:
+                details["capital_intensity"] = (True, f"ROA {roa:.2f}%，金融业可接受")
+            else:
+                details["capital_intensity"] = (False, f"ROA {roa:.2f}%，金融业偏低")
         else:
-            details["capital_intensity"] = (False, f"ROA {roa:.1f}%，重资产模式")
+            if roa > 10:
+                details["capital_intensity"] = (True, f"ROA {roa:.1f}%，轻资产模式")
+            elif roa > 5:
+                details["capital_intensity"] = (True, f"ROA {roa:.1f}%，适中")
+            else:
+                details["capital_intensity"] = (False, f"ROA {roa:.1f}%，重资产模式")
     else:
-        details["capital_intensity"] = (False, "数据不足")
+        if is_financial:
+            details["capital_intensity"] = (True, "金融业，资本效率不适用")
+        else:
+            details["capital_intensity"] = (False, "数据不足")
 
-    # 5. 负债水平
+    # 5. 负债水平（金融行业杠杆天生高，豁免）
     dte = data.get("debt_to_equity")
     net_cash = data.get("net_cash")
     if dte is not None:
-        if dte < 30:
+        if is_financial:
+            details["debt"] = (True, f"D/E {dte:.0f}%（金融行业常态）")
+        elif dte < 30:
             details["debt"] = (True, f"D/E {dte:.0f}%，负债很低")
         elif dte < 60:
             details["debt"] = (True, f"D/E {dte:.0f}%，负债可控")
@@ -448,12 +480,19 @@ def gate3_moat(data: Dict[str, Any], company: Dict[str, Any]) -> Tuple[int, Dict
     info = company.get("raw_info", {})
     industry = (data.get("industry") or "").lower()
     sector = (data.get("sector") or "").lower()
+    country = (company.get("country") or "").lower()
     details: Dict[str, Tuple[str, str]] = {}
+
+    is_financial = any(kw in sector + industry for kw in ["bank", "financial", "insurance", "diversified financial", "money center"])
+    # 双寡头/寡头垄断行业（通常受监管，进入壁垒极高）
+    oligopoly = ["bank", "telecom", "utility", "railroad", "credit card", "exchange"]
 
     # 1. 品牌 / 定价权
     gm = data.get("gross_margin_pct")
     if gm is not None:
-        if gm > 50:
+        if is_financial:
+            details["brand"] = ("具备", f"金融业，品牌信任为护城河（数据仅供参考）")
+        elif gm > 50:
             details["brand"] = ("具备", f"毛利率 {gm:.1f}%，强定价权")
         elif gm > 30:
             details["brand"] = ("部分", f"毛利率 {gm:.1f}%，有一定定价能力")
@@ -462,19 +501,27 @@ def gate3_moat(data: Dict[str, Any], company: Dict[str, Any]) -> Tuple[int, Dict
     else:
         details["brand"] = ("待查", "数据不足")
 
-    # 2. 转换成本
-    high_switch = ["software", "cloud", "enterprise", "bank", "financial", "database", "erp"]
-    if any(w in industry for w in high_switch):
-        details["switching_cost"] = ("可能具备", f"行业特征：{industry}，客户转换成本较高")
+    # 2. 转换成本（金融行业极高：账户迁移成本 + 信用记录绑定性）
+    if is_financial:
+        details["switching_cost"] = ("具备", "金融业账户迁移成本极高，客户粘性强")
+    elif any(w in industry for w in ["software", "cloud", "enterprise", "database", "erp"]):
+        details["switching_cost"] = ("具备", f"行业特征：{industry}，客户转换成本较高")
+    elif any(w in industry for w in ["bank", "financial"]):
+        details["switching_cost"] = ("可能具备", f"行业特征：{industry}，转换成本较高")
     else:
         details["switching_cost"] = ("一般", f"行业特征：{industry}，转换成本不确定")
 
-    # 3. 网络效应
-    network = ["internet", "social", "marketplace", "platform", "media", "communication"]
-    if any(w in industry for w in network):
-        details["network_effect"] = ("可能具备", "行业特征暗示网络效应")
+    # 3. 寡头 / 监管壁垒（最宽的护城河之一）
+    if is_financial:
+        # 加拿大五大行是经典寡头案例
+        if country == "canada":
+            details["oligopoly"] = ("极强", "加拿大五大行寡头垄断，外资进入受限，护城河极宽")
+        else:
+            details["oligopoly"] = ("可能具备", "金融业受严格监管，新进入者壁垒高")
+    elif any(w in industry for w in oligopoly):
+        details["oligopoly"] = ("可能具备", f"行业特征：{industry}，寡头格局")
     else:
-        details["network_effect"] = ("不明显", "非平台型业务模式")
+        details["oligopoly"] = ("不明显", "非寡头垄断行业")
 
     # 4. 规模 / 成本优势
     rev = info.get("totalRevenue", 0)
@@ -488,7 +535,7 @@ def gate3_moat(data: Dict[str, Any], company: Dict[str, Any]) -> Tuple[int, Dict
     else:
         details["scale"] = ("有限", "规模优势不明显")
 
-    # 5. 技术 / 专利壁垒
+    # 5. 技术 / 专利壁垒（非技术行业不适用，不扣分）
     tech = ["semiconductor", "biotech", "pharmaceutical", "technology", "software", "hardware"]
     if any(w in industry for w in tech):
         rd = info.get("researchAndDevelopment")
@@ -504,11 +551,13 @@ def gate3_moat(data: Dict[str, Any], company: Dict[str, Any]) -> Tuple[int, Dict
         else:
             details["tech_moat"] = ("待查", "数据不足")
     else:
-        details["tech_moat"] = ("不适用", "非技术驱动型行业")
+        details["tech_moat"] = ("N/A", "非技术驱动行业，不计入")
 
-    strong = sum(1 for v in details.values() if v[0] in ("具备", "较强", "可能具备"))
+    strong = sum(1 for v in details.values() if v[0] in ("具备", "较强", "极强", "可能具备"))
+    # 寡头垄断额外加分
+    oligopoly_boost = 1 if details.get("oligopoly", ("", ""))[0] == "极强" else 0
     mapping = {5: 5, 4: 4, 3: 4, 2: 3, 1: 2, 0: 1}
-    return mapping.get(strong, 1), details
+    return min(5, mapping.get(strong, 1) + oligopoly_boost), details
 
 
 # ─── 第四关：管理层 ─────────────────────────────────
@@ -720,19 +769,50 @@ def gate6_decision_discipline(data: Dict[str, Any]) -> Tuple[int, List[str]]:
     """检查 FOMO、市场预期、容错空间等情绪信号。"""
     warnings: List[str] = []
 
+    # ── 1. 接力棒效应：过去1年涨幅过大（阈值更敏感） ──
     hist = data.get("price_history")
+    pe = data.get("pe_ttm")
+    roe = data.get("roe_pct")
+
     if hist is not None and len(hist) > 252:
         recent = hist["Close"].iloc[-252:]
         r1y = (recent.iloc[-1] / recent.iloc[0] - 1) * 100
         if r1y > 80:
-            warnings.append(f"📈 过去1年涨幅 {r1y:.0f}%，警惕 FOMO 情绪")
+            warnings.append(f"📈 过去1年涨幅 {r1y:.0f}%，警惕 FOMO 接力棒效应")
+        elif r1y > 50:
+            # 涨幅 50%+：如果是金融/公用事业这类慢速行业，明显过热
+            if pe and roe:
+                peg = pe / roe if roe > 0 else 999
+                if peg > 1.5 or r1y > 60:
+                    warnings.append(f"📈 1年涨 {r1y:.0f}% + PEG={peg:.1f}x，警惕接力棒效应")
+            elif pe and pe > 20:
+                warnings.append(f"📈 1年涨 {r1y:.0f}% + PE={pe:.0f}x，警惕追涨")
+            elif not pe:
+                warnings.append(f"📈 1年涨 {r1y:.0f}%，警惕接力棒效应")
+        elif r1y > 40:
+            if pe and roe:
+                peg = pe / roe if roe > 0 else 999
+                if peg > 2:
+                    warnings.append(f"📈 1年涨 {r1y:.0f}% + PEG={peg:.1f}x，警惕追涨")
         elif r1y < -40:
             warnings.append(f"📉 过去1年跌幅 {r1y:.0f}%，确认不是价值陷阱")
 
-    pe = data.get("pe_ttm")
-    if pe is not None and pe > 50:
-        warnings.append("⚡ PE>50x，市场预期极高，容错空间极小")
+    # ── 2. PE 过高 + 低增长（博傻） ──
+    rg = data.get("revenue_growth_pct")
+    if pe is not None and pe > 40:
+        warnings.append(f"⚠️ PE={pe:.0f}x，市场预期极高")
+    elif pe is not None and pe > 25 and rg is not None and rg < 10:
+        warnings.append(f"⚡ PE={pe:.0f}x 但增速仅 {rg:.0f}%，容错空间小")
 
+    # ── 3. 股价接近52周高点（追涨信号） ──
+    price = data.get("price")
+    high_52w = data.get("52w_high")
+    if price and high_52w and high_52w > 0:
+        pct_of_high = (price / high_52w) * 100
+        if pct_of_high > 95:
+            warnings.append(f"📊 股价距52周高仅差 {100-pct_of_high:.0f}%（{price:.0f}/{high_52w:.0f}），追涨风险")
+
+    # ── 4. 超大市值公司 ──
     mcap = data.get("market_cap", 0)
     if mcap > 1.5e12:
         warnings.append("🏛️ 超大市值公司，未来增长空间有限")
@@ -882,6 +962,15 @@ def generate_report(
         effective_passed = passed - 1  # 通过 → 灰色
     elif g5 < 2 and effective_passed >= 3:
         effective_passed = passed - 1  # 灰色 → 不通过
+    # 双重边缘降级：安全边际和纪律同时弱时降级
+    if g5 <= 3 and g6 <= 3 and effective_passed >= 4:
+        effective_passed -= 1  # 通过 → 灰色
+    elif g5 <= 3 and g6 <= 2 and effective_passed >= 3:
+        effective_passed -= 1  # 灰色 → 不通过
+    # 软降级：好公司 + 贵价 + 有追涨信号 → 强制灰色
+    # 典型场景：RY 这种顶级银行，PE=19x高位，股价距52周高仅差3%
+    if g5 <= 3 and g6 <= 4 and effective_passed >= 4 and g1 >= 4 and g3 >= 4:
+        effective_passed = max(effective_passed - 2, 2)  # 通过 → 不通过
 
     if effective_passed >= 4:
         conclusion = "✅ **Checklist 总体评估：通过** — 可以进入深度研究阶段\n"

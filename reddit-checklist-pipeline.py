@@ -304,6 +304,16 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         elif g5 < 2 and passed >= 3:
             passed -= 1  # 灰色 → 不通过
 
+        # ── 双重边缘降级规则 ──
+        # 当安全边际和纪律同时处于边缘时，说明"贵 + 追涨"，应降级
+        if g5 <= 3 and g6 <= 3 and passed >= 4:
+            passed -= 1  # 通过 → 灰色
+        elif g5 <= 3 and g6 <= 2 and passed >= 3:
+            passed -= 1  # 灰色 → 不通过
+        # 软降级：好公司 + 贵价 + 有追涨信号 → 强制灰色
+        if g5 <= 3 and g6 <= 4 and passed >= 4 and g1 >= 4 and g3 >= 4:
+            passed = max(passed - 2, 2)
+
         # ── 否决清单 ──
         if vetoes:
             passed = 0  # 触发否决 → 直接不通过
