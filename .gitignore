@@ -8,3 +8,5 @@ build/
 .output/
 output/
 !output/.gitkeep
+.yf_cache/
+test_*.py

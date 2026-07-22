@@ -34,6 +34,43 @@ except ImportError as e:
     print("请安装所需包:  pip install yfinance pandas numpy")
     sys.exit(1)
 
+# ── yfinance 缓存（防限流） ──
+_YF_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".yf_cache")
+os.makedirs(_YF_CACHE_DIR, exist_ok=True)
+_YF_CACHE_TTL = 6 * 3600  # 6 小时
+
+
+def _yf_cached(ticker: str) -> "yf.Ticker":
+    """带文件缓存的 yfinance Ticker，避免频繁限流。"""
+    import json
+    cache_key = ticker.strip().upper()
+    cache_path = os.path.join(_YF_CACHE_DIR, f"{cache_key}.json")
+
+    # 缓存命中且未过期 → 直接从缓存恢复
+    if os.path.exists(cache_path):
+        try:
+            mtime = os.path.getmtime(cache_path)
+            if time.time() - mtime < _YF_CACHE_TTL:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                # 用 cached info 构造一个轻量对象
+                stock = yf.Ticker(ticker)
+                stock._info = cached  # 直接注入缓存数据
+                return stock
+        except Exception:
+            pass
+
+    # 缓存未命中 → 正常请求
+    stock = yf.Ticker(ticker)
+    try:
+        info = stock.info
+        if info:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False, default=str)
+    except Exception:
+        pass  # 缓存写失败不影响主流程
+    return stock
+
 # ── 导入 financial_rigor （精确计算引擎） ──
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
@@ -48,10 +85,10 @@ REPORT_DIR = os.path.expanduser("~/巴菲特Checklist")
 # ╚══════════════════════════════════════════════════════════════╝
 
 def identify_company(raw: str) -> Dict[str, Any]:
-    """通过股票代码获取公司基础信息。"""
+    """通过股票代码获取公司基础信息（带缓存）。"""
     ticker = raw.strip().upper()
     try:
-        stock = yf.Ticker(ticker)
+        stock = _yf_cached(ticker)
         info = stock.info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if price is None and not info.get("longName"):
@@ -102,38 +139,54 @@ def grade_information_availability(company: Dict[str, Any]) -> Tuple[str, str]:
 # ║  Step 2: 数据收集                                          ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def collect_financial_data(company: Dict[str, Any]) -> Dict[str, Any]:
-    """收集全面的财务数据。"""
+def collect_financial_data(company: Dict[str, Any],
+                           futu_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """收集全面的财务数据。
+
+    Args:
+        company: identify_company() 返回的公司信息（含 yfinance raw_info）
+        futu_data: 可选，FutuDataProvider 获取的实时行情数据（更准更快）
+    """
     info = company.get("raw_info", {})
     d: Dict[str, Any] = {}
 
     # ── Price & Valuation ──
-    d["price"] = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-    d["market_cap"] = info.get("marketCap", 0)
-    d["pe_ttm"] = info.get("trailingPE")
+    # 优先用 Futu 实时行情（更准），yfinance 兜底
+    if futu_data:
+        d["price"] = futu_data.get("price") or info.get("currentPrice") or info.get("regularMarketPrice", 0)
+        d["market_cap"] = futu_data.get("market_cap") or info.get("marketCap", 0)
+        d["pe_ttm"] = futu_data.get("pe_ttm") or info.get("trailingPE")
+        d["pb"] = futu_data.get("pb") or info.get("priceToBook")
+        d["dividend_yield_pct"] = futu_data.get("dividend_yield_pct")
+        d["eps_ttm"] = futu_data.get("eps_ttm") or info.get("trailingEps")
+        d["bvps"] = futu_data.get("bvps") or info.get("bookValue")
+    else:
+        d["price"] = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+        d["market_cap"] = info.get("marketCap", 0)
+        d["pe_ttm"] = info.get("trailingPE")
+        d["pb"] = info.get("priceToBook")
+        div_yield = info.get("dividendYield")
+        d["dividend_yield_pct"] = round(div_yield * 100, 2) if div_yield else None
+        d["eps_ttm"] = info.get("trailingEps")
+        d["bvps"] = info.get("bookValue")
+
     d["forward_pe"] = info.get("forwardPE")
-    d["pb"] = info.get("priceToBook")
-    div_yield = info.get("dividendYield")
-    d["dividend_yield_pct"] = round(div_yield * 100, 2) if div_yield else None
     fcf_yield = info.get("freeCashflowYield")
     d["fcf_yield_pct"] = round(fcf_yield, 1) if fcf_yield else None
     d["ps"] = info.get("priceToSalesTrailing12Months")
 
     # ── Profitability ──
-    gm = info.get("grossMargins")
-    d["gross_margin_pct"] = round(gm * 100, 1) if gm else None
-    nm = info.get("profitMargins")
-    d["net_margin_pct"] = round(nm * 100, 1) if nm else None
-    roe = info.get("returnOnEquity")
-    d["roe_pct"] = round(roe * 100, 1) if roe else None
-    roa = info.get("returnOnAssets")
-    d["roa_pct"] = round(roa * 100, 1) if roa else None
+    # 这些字段 yfinance 有，Futu 需要从财报算（暂时以 yfinance 为准）
+    d["gross_margin_pct"] = round(info.get("grossMargins", 0) * 100, 1) if info.get("grossMargins") else None
+    d["net_margin_pct"] = round(info.get("profitMargins", 0) * 100, 1) if info.get("profitMargins") else None
+    roe_yf = info.get("returnOnEquity")
+    roe_ft = futu_data.get("roe_pct") if futu_data else None
+    d["roe_pct"] = roe_ft or (round(roe_yf * 100, 1) if roe_yf else None)
+    d["roa_pct"] = round(info.get("returnOnAssets", 0) * 100, 1) if info.get("returnOnAssets") else None
 
     # ── Growth ──
-    rg = info.get("revenueGrowth")
-    d["revenue_growth_pct"] = round(rg * 100, 1) if rg else None
-    eg = info.get("earningsGrowth")
-    d["earnings_growth_pct"] = round(eg * 100, 1) if eg else None
+    d["revenue_growth_pct"] = round(info.get("revenueGrowth", 0) * 100, 1) if info.get("revenueGrowth") else None
+    d["earnings_growth_pct"] = round(info.get("earningsGrowth", 0) * 100, 1) if info.get("earningsGrowth") else None
 
     # ── Financial Health ──
     d["total_debt"] = info.get("totalDebt")
@@ -147,9 +200,7 @@ def collect_financial_data(company: Dict[str, Any]) -> Dict[str, Any]:
         d["net_cash"] = None
 
     # ── Per Share ──
-    d["eps_ttm"] = info.get("trailingEps")
     d["eps_forward"] = info.get("forwardEps")
-    d["bvps"] = info.get("bookValue")
     d["fcf_per_share"] = info.get("freeCashflowPerShare")
 
     # ── Ownership ──
@@ -159,20 +210,37 @@ def collect_financial_data(company: Dict[str, Any]) -> Dict[str, Any]:
     d["institution_pct"] = round(inst * 100, 1) if inst else None
 
     # ── Management ──
-    d["ceo"] = info.get("companyOfficers", [{}])[0].get("name") if info.get("companyOfficers") else None
+    d["ceo"] = futu_data.get("ceo") if futu_data else None
+    if not d["ceo"]:
+        d["ceo"] = info.get("companyOfficers", [{}])[0].get("name") if info.get("companyOfficers") else None
 
     # ── Historical Price ──
-    try:
-        hist = yf.Ticker(company["ticker"]).history(period="5y")
-        if not hist.empty:
-            d["price_history"] = hist
-            d["5y_return"] = round((hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1) * 100, 1)
-    except Exception:
-        pass
+    # 优先用 Futu K 线（实时），yfinance 兜底
+    if futu_data and futu_data.get("price_history"):
+        d["price_history"] = futu_data["price_history"]
+        if len(futu_data["price_history"]) > 1:
+            first = futu_data["price_history"][0]["close"]
+            last = futu_data["price_history"][-1]["close"]
+            d["5y_return"] = round((last / first - 1) * 100, 1) if first > 0 else None
+    else:
+        try:
+            hist = yf.Ticker(company["ticker"]).history(period="5y")
+            if not hist.empty:
+                d["price_history"] = hist
+                d["5y_return"] = round((hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1) * 100, 1)
+        except Exception:
+            pass
 
     # ── Sector / Industry ──
     d["sector"] = info.get("sector", "")
     d["industry"] = info.get("industry", "")
+
+    # ── Futu 额外字段 ──
+    if futu_data:
+        d["52w_high"] = futu_data.get("52w_high")
+        d["52w_low"] = futu_data.get("52w_low")
+        d["net_profit"] = futu_data.get("net_profit")
+        d["net_asset"] = futu_data.get("net_asset")
 
     return d
 

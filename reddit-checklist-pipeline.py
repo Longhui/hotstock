@@ -200,27 +200,48 @@ def rank_tickers(posts: list) -> List[Dict[str, Any]]:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
-    """对单个 ticker 执行投资 Checklist 分析（含自动重试）。"""
+    """对单个 ticker 执行投资 Checklist 分析（Futu 优先，yfinance 兜底）。"""
     mod = _load_checklist()
 
-    # ── 带重试的 yfinance 调用（代理不稳定时自动重试） ──
-    max_retries = 3
-    last_err = None
+    # ── 优先尝试 Futu API（更快、不限流） ──
+    futu_data = None
+    try:
+        _tools_dir = os.path.join(BASE_DIR, "tools")
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        import futu_data as _fd
+        fp = _fd.FutuDataProvider()
+        if fp.health_check():
+            futu_data = fp.get_all_data(ticker)
+            if futu_data:
+                logger.debug(f"  ✅ Futu: {ticker} 数据获取成功")
+    except Exception as e:
+        logger.debug(f"  Futu 不可用: {e}")
+
+    # ── yfinance 调用（带缓存 + 重试） ──
+    max_retries = 2 if futu_data else 3
     company = None
 
     for attempt in range(1, max_retries + 1):
         try:
             company = mod.identify_company(ticker)
             if company.get("error"):
-                # 404 等明确错误不用重试
                 logger.warning(f"  ⚠️ {ticker}: {company['error']}")
-                return None
-            # 成功拿到数据，跳出重试循环
+                # 有 Futu 数据但 yfinance 识别失败时，构造最小 company 对象
+                if futu_data and not company.get("is_listed", True):
+                    company = {
+                        "ticker": ticker,
+                        "name": futu_data.get("company_name", ticker),
+                        "error": None,
+                        "is_listed": True,
+                        "raw_info": {},
+                    }
+                else:
+                    return None
             break
         except (ConnectionError, TimeoutError, OSError) as e:
-            last_err = e
             if attempt < max_retries:
-                wait = attempt * 5  # 5s, 10s, 15s
+                wait = attempt * 5
                 logger.debug(f"  ⏳ {ticker} 第{attempt}次失败，{wait}s后重试...")
                 time.sleep(wait)
             else:
@@ -230,16 +251,15 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        # 数据收集（同样加重试）
+        # 数据收集：传入 Futu 数据，减少 yfinance 依赖
         data = None
         news = []
         for attempt in range(1, max_retries + 1):
             try:
-                data = mod.collect_financial_data(company)
+                data = mod.collect_financial_data(company, futu_data=futu_data)
                 news = mod.collect_news(ticker)
                 break
             except (ConnectionError, TimeoutError, OSError) as e:
-                last_err = e
                 if attempt < max_retries:
                     wait = attempt * 5
                     logger.debug(f"  ⏳ {ticker} 数据收集第{attempt}次失败，{wait}s后重试...")
@@ -248,6 +268,9 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
                     logger.warning(f"  ⚠️ {ticker}: 数据收集重试{max_retries}次仍失败 — {e}")
         if data is None:
             return None
+
+        # 标记数据来源（用于报告显示）
+        data["data_source"] = "Futu + yfinance" if futu_data else "yfinance"
 
         # 信息评级
         grade, grade_desc = mod.grade_information_availability(company)
