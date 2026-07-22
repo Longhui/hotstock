@@ -40,36 +40,41 @@ os.makedirs(_YF_CACHE_DIR, exist_ok=True)
 _YF_CACHE_TTL = 6 * 3600  # 6 小时
 
 
-def _yf_cached(ticker: str) -> "yf.Ticker":
-    """带文件缓存的 yfinance Ticker，避免频繁限流。"""
+def _yf_get_info(ticker: str) -> dict:
+    """带文件缓存的 yfinance info 获取，缓存命中直接返回 dict。"""
     import json
     cache_key = ticker.strip().upper()
     cache_path = os.path.join(_YF_CACHE_DIR, f"{cache_key}.json")
 
-    # 缓存命中且未过期 → 直接从缓存恢复
+    # 缓存命中且未过期 → 直接返回缓存数据
     if os.path.exists(cache_path):
         try:
             mtime = os.path.getmtime(cache_path)
             if time.time() - mtime < _YF_CACHE_TTL:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                # 用 cached info 构造一个轻量对象
-                stock = yf.Ticker(ticker)
-                stock._info = cached  # 直接注入缓存数据
-                return stock
+                if isinstance(cached, dict) and cached.get("currentPrice"):
+                    return cached
         except Exception:
             pass
 
     # 缓存未命中 → 正常请求
-    stock = yf.Ticker(ticker)
     try:
-        info = stock.info
-        if info:
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+        if info and info.get("currentPrice"):
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(info, f, ensure_ascii=False, default=str)
-    except Exception:
-        pass  # 缓存写失败不影响主流程
-    return stock
+        return info
+    except Exception as e:
+        # 请求失败但有旧缓存 → 用旧缓存兜底
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        raise e
 
 # ── 导入 financial_rigor （精确计算引擎） ──
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -88,8 +93,7 @@ def identify_company(raw: str) -> Dict[str, Any]:
     """通过股票代码获取公司基础信息（带缓存）。"""
     ticker = raw.strip().upper()
     try:
-        stock = _yf_cached(ticker)
-        info = stock.info
+        info = _yf_get_info(ticker)
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         if price is None and not info.get("longName"):
             return {"ticker": ticker, "error": f"无法获取 {ticker} 的数据，请检查代码是否正确"}
