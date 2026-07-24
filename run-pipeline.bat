@@ -2,6 +2,15 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM 日志文件（记录错误信息）
+set LOGFILE=%~dp0output\pipeline_%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%.log
+if not exist "%~dp0output" mkdir "%~dp0output"
+
+echo ════════════════════════════════════════════>>"%LOGFILE%"
+echo   Reddit 热门股票 → 巴菲特 Checklist 分析流水线>>"%LOGFILE%"
+echo   开始时间：%DATE% %TIME%>>"%LOGFILE%"
+echo ════════════════════════════════════════════>>"%LOGFILE%"
+
 echo ════════════════════════════════════════════
 echo   Reddit 热门股票 → 巴菲特 Checklist 分析流水线
 echo ════════════════════════════════════════════
@@ -27,10 +36,20 @@ echo.
 echo 🚀 运行流水线（Top 15，使用代理 127.0.0.1:3067）...
 echo.
 
-python reddit-checklist-pipeline.py --top 15
+python reddit-checklist-pipeline.py --top 15 >>"%LOGFILE%" 2>&1
 
+set EXIT_CODE=%ERRORLEVEL%
 echo.
-echo ✅ 执行完毕！
+echo ✅ 执行完毕！退出码：%EXIT_CODE%>>"%LOGFILE%"
+if %EXIT_CODE% NEQ 0 (
+    echo ❌ 流水线执行失败，请查看日志：%LOGFILE%>>"%LOGFILE%"
+)
+echo ════════════════════════════════════════════>>"%LOGFILE%"
 echo.
+if %EXIT_CODE% NEQ 0 (
+    echo ❌ 执行失败（退出码 %EXIT_CODE%），日志：%LOGFILE%
+) else (
+    echo ✅ 执行完毕！
+)
 echo 报告已保存到 output/ 目录
 echo 窗口将在 10 秒后自动关闭...

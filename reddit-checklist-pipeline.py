@@ -46,12 +46,10 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-# ── 代理配置 ──
-PROXY = "http://127.0.0.1:3067"
-os.environ["HTTP_PROXY"] = PROXY
-os.environ["HTTPS_PROXY"] = PROXY
-os.environ["http_proxy"] = PROXY
-os.environ["https_proxy"] = PROXY
+# ── 代理配置（显式传参，不用环境变量——requests 对 env var 处理不一致） ──
+_PROXY = "http://127.0.0.1:3067"
+_PROXIES = {"http": _PROXY, "https": _PROXY}
+logger.info(f"  🌐 代理 {_PROXY}")
 
 # 全局超时（yfinance 连接有时较慢）
 os.environ["YFINANCE_TIMEOUT"] = "60"
@@ -106,7 +104,7 @@ def fetch_reddit_rss(sub: str, max_posts: int = 100, max_age_days: int = 7) -> l
 
     for attempt in range(2):
         try:
-            resp = requests.get(url, timeout=30, headers=HEADERS)
+            resp = requests.get(url, timeout=30, headers=HEADERS, proxies=_PROXIES)
             if resp.status_code != 200:
                 logger.debug(f"  RSS r/{sub}: HTTP {resp.status_code} (attempt {attempt+1})")
                 if attempt == 0:
