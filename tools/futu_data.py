@@ -128,7 +128,7 @@ class FutuDataProvider:
             mcap = float(row.get("total_market_val", 0) or 0)
 
             result["roe_pct"] = round(np / na * 100, 1) if na > 0 and np > 0 else None
-            result["net_margin_pct"] = None  # 需要 revenue，snapshot 没有
+            result["net_margin_pct"] = None
             result["gross_margin_pct"] = None
             result["roa_pct"] = None
 
@@ -246,7 +246,61 @@ class FutuDataProvider:
             logger.debug(f"Futu kline({ticker}): {e}")
             return None
 
-    # ── 新闻 ──
+    # ── 财务指标（从财报获取，短超时避免卡死） ──
+
+    def get_financials(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """尝试获取财务指标（短超时，获取不到不影响主流程）。"""
+        ctx = self._ensure_ctx()
+        if ctx is None:
+            return None
+
+        code = self.to_futu_code(ticker)
+        result: Dict[str, Any] = {}
+
+        try:
+            from futu import FinancialQuarter
+            import socket
+            old_to = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(10)
+            ret, data = ctx.get_financials_statements(
+                code, FinancialQuarter.ANNUAL, None, None, None, 1
+            )
+            socket.setdefaulttimeout(old_to)
+
+            if ret != 0 or data is None or len(data) == 0:
+                return None
+
+            for _, row in data.iterrows():
+                for col in data.columns:
+                    cl = col.lower()
+                    val = row[col]
+                    if val is None or str(val) in ('', 'nan', 'N/A'):
+                        continue
+                    try:
+                        fval = float(val)
+                    except (ValueError, TypeError):
+                        continue
+                    if 'gross_profit' in cl and 'ratio' in cl:
+                        result['gross_margin_pct'] = round(fval, 1)
+                    elif cl == 'net_profit_ratio' or 'net_margin' in cl:
+                        result['net_margin_pct'] = round(fval, 1)
+                    elif 'free_cash_flow' in cl:
+                        result['free_cf'] = fval
+                    elif 'operating_cash' in cl or 'nocf' in cl:
+                        result['operating_cf'] = fval
+                    elif 'revenue' in cl and 'growth' in cl:
+                        result['revenue_growth_pct'] = round(fval, 1)
+                    elif 'debt_to_assets' in cl or 'debt_ratio' in cl:
+                        result['debt_to_equity'] = round(fval, 1)
+                    elif 'total_debt' in cl or 'interest_bearing_debt' in cl:
+                        result['total_debt'] = fval
+                    elif 'cash_equivalents' in cl:
+                        result['total_cash'] = fval
+            return result if result else None
+
+        except Exception as e:
+            logger.debug(f'Futu financials({ticker}): {e}')
+            return None    # ── 新闻 ──
 
     def get_news(self, ticker: str, max_items: int = 8) -> List[Dict[str, str]]:
         """获取公司新闻。"""

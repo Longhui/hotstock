@@ -68,7 +68,7 @@ def _yf_get_info(ticker: str) -> dict:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(info, f, ensure_ascii=False, default=str)
         return info
-    except Exception as e:
+    except Exception:
         # 请求失败但有旧缓存 → 用旧缓存兜底
         if os.path.exists(cache_path):
             try:
@@ -76,7 +76,8 @@ def _yf_get_info(ticker: str) -> dict:
                     return json.load(f)
             except Exception:
                 pass
-        raise e
+        # 没缓存也绝不死，返回最小信息让 identify_company 能走通
+        return {"ticker": ticker, "currentPrice": None}
 
 # ── 导入 financial_rigor （精确计算引擎） ──
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
