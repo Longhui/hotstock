@@ -203,7 +203,6 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
 
     # ── 优先尝试 Futu API（更快、不限流） ──
     futu_data = None
-    futu_financials = None
     try:
         _tools_dir = os.path.join(BASE_DIR, "tools")
         if _tools_dir not in sys.path:
@@ -214,11 +213,6 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             futu_data = fp.get_all_data(ticker)
             if futu_data:
                 logger.debug(f"  ✅ Futu: {ticker} 数据获取成功")
-                # 尝试获取财报指标（gross_margin/FCF 等，短超时）
-                futu_financials = fp.get_financials(ticker)
-                if futu_financials:
-                    futu_data.update(futu_financials)
-                    logger.debug(f"  ✅ Futu financials: {ticker}")
     except Exception as e:
         logger.debug(f"  Futu 不可用: {e}")
 
