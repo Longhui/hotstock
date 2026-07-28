@@ -758,7 +758,7 @@ def main():
             "  python reddit-checklist-pipeline.py --subs wallstreetbets,stocks\n"
         ),
     )
-    parser.add_argument("--top", type=int, default=15, help="分析前 N 只热门股 (默认 15)")
+    parser.add_argument("--top", type=int, default=8, help="分析前 N 只热门股 (默认 8)")
     parser.add_argument("--min-score", type=float, default=0,
                         help="最低综合分门槛 (默认 0 = 不限)")
     parser.add_argument("--max-posts", type=int, default=100,

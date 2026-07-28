@@ -33,10 +33,10 @@ REM 设置 UTF-8 编码，避免 GBK 无法显示 emoji
 set PYTHONIOENCODING=utf-8
 
 echo.
-echo 🚀 运行流水线（Top 15，使用代理 127.0.0.1:3067）...
+echo 🚀 运行流水线（Top 8，使用代理 127.0.0.1:3067）...
 echo.
 
-python reddit-checklist-pipeline.py --top 15 >>"%LOGFILE%" 2>&1
+python reddit-checklist-pipeline.py --top 8 >>"%LOGFILE%" 2>&1
 
 set EXIT_CODE=%ERRORLEVEL%
 echo.
