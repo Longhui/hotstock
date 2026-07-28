@@ -267,8 +267,29 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         if data is None:
             return None
 
-        # 标记数据来源（用于报告显示）
+        # ── FMP 补数据：当 yfinance 限流导致关键指标缺失时 ──
+        if futu_data and (data.get("gross_margin_pct") is None or data.get("free_cf") is None):
+            try:
+                _tools_dir = os.path.join(BASE_DIR, "tools")
+                if _tools_dir not in sys.path:
+                    sys.path.insert(0, _tools_dir)
+                import fmp_data as _fmp
+                fmp_fin = _fmp.get_financials(ticker)
+                if fmp_fin:
+                    for _k in ["gross_margin_pct", "net_margin_pct", "roe_pct", "roa_pct",
+                                "free_cf", "debt_to_equity", "fcf_yield_pct",
+                                "revenue_growth_pct", "earnings_growth_pct",
+                                "total_debt", "total_cash"]:
+                        if data.get(_k) is None and fmp_fin.get(_k) is not None:
+                            data[_k] = fmp_fin[_k]
+                    logger.debug(f"  ✅ FMP: {ticker} 财务数据补充")
+            except Exception:
+                pass
+
+        # 标记数据来源
         data["data_source"] = "Futu + yfinance" if futu_data else "yfinance"
+        if data.get("gross_margin_pct") is not None and "yfinance" not in str(data.get("data_source", "")):
+            data["data_source"] = "Futu + FMP"
 
         # 信息评级
         grade, grade_desc = mod.grade_information_availability(company)
