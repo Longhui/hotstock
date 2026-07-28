@@ -76,8 +76,11 @@ def _yf_get_info(ticker: str) -> dict:
                     return json.load(f)
             except Exception:
                 pass
-        # 没缓存也绝不死，返回最小信息让 identify_company 能走通
-        return {"ticker": ticker, "currentPrice": None}
+        # 没缓存也绝不死，返回最小信息
+        # 注意：identify_company 会检查 currentPrice/longName，
+        # 这里至少要给一个 longName 让它能通过基础校验
+        return {"currentPrice": None, "longName": ticker,
+                "shortName": ticker, "exchange": "N/A"}
 
 # ── 导入 financial_rigor （精确计算引擎） ──
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
